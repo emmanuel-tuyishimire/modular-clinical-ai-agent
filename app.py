@@ -1,7 +1,7 @@
 import json
 import streamlit as st
 from google import genai
-from google.genai import errors
+from google.genai import errors, types
 
 # --- PAGE CONFIGURATION ---
 st.set_page_config(
@@ -27,11 +27,21 @@ LOW_STOCK_THRESHOLDS = {
     "malaria_rdts": 5,
 }
 
+# Action tools return complete human-ready confirmations on the first call (no 2nd LLM trip needed)
+DIRECT_ACTION_TOOLS = {
+    "admit_patient",
+    "use_supply",
+    "discharge_patient",
+    "add_todo",
+    "complete_todo",
+    "add_expense",
+    "get_total",
+}
+
 
 # =====================================================================
 # 1. INITIALIZE BROWSER MEMORY (st.session_state)
 # =====================================================================
-# Streamlit reruns this script on every click, so st.session_state keeps our data alive.
 
 if "ward_patients" not in st.session_state:
     st.session_state.ward_patients = []
@@ -94,7 +104,17 @@ def admit_patient(parameters):
         "rr": rr,
         "acuity": acuity,
     })
-    return f"Admitted {name} to {bed} | Acuity: {acuity} | SpO2: {spo2}%, HR: {hr}, RR: {rr}"
+
+    action_note = ""
+    if "RED" in acuity:
+        action_note = " — Immediate bedside assessment & airway/oxygen readiness required!"
+    elif "YELLOW" in acuity:
+        action_note = " — Urgent clinical review recommended."
+
+    return (
+        f"Admitted {name} to {bed} | Acuity: {acuity} "
+        f"(SpO2: {spo2}%, HR: {hr}, RR: {rr}){action_note}"
+    )
 
 
 def get_ward_board(parameters):
@@ -285,19 +305,37 @@ AGENTS = {
 # 4. AI CONNECTION & PROMPT HELPERS
 # =====================================================================
 
+@st.cache_resource
+def get_gemini_client(api_key):
+    """Reuses a single Gemini client connection across messages for faster responses."""
+    return genai.Client(api_key=api_key)
+
+
 def call_gemini(prompt, api_key):
-    """Sends the formatted conversation transcript to Gemini and returns plain text."""
-    client = genai.Client(api_key=api_key)
+    """Sends the formatted conversation transcript to Gemini with compact output settings."""
+    client = get_gemini_client(api_key)
     try:
         response = client.models.generate_content(
             model="gemini-3.8-flash",
             contents=prompt,
+            config=types.GenerateContentConfig(
+                temperature=0.1,
+                max_output_tokens=300,
+            ),
         )
         return response.text
     except errors.ServerError:
         return json.dumps({
             "type": "response_to_human",
-            "message": "Google's AI server is temporarily busy. Please send your message again in a few seconds.",
+            "message": (
+                "Google's AI server is currently experiencing high traffic. "
+                "You can retry your message in a few seconds, or use the Quick Ward Actions panel above for instant 0-second updates."
+            ),
+        })
+    except errors.ClientError:
+        return json.dumps({
+            "type": "response_to_human",
+            "message": "API key or request error. Please verify your Gemini API key in Settings.",
         })
 
 
@@ -331,7 +369,6 @@ def format_messages(messages):
 # 5. STREAMLIT WEB INTERFACE
 # =====================================================================
 
-# Sidebar: Agent selector, API key configuration, and reset controls
 with st.sidebar:
     st.title("⚙️ Agent Controls")
     selected_name = st.selectbox("Choose an Agent:", list(AGENTS.keys()))
@@ -339,7 +376,6 @@ with st.sidebar:
 
     st.divider()
 
-    # Safely check for a cloud secret; if running locally without secrets.toml, show the input box
     try:
         server_key = st.secrets["GEMINI_API_KEY"]
     except Exception:
@@ -354,13 +390,11 @@ with st.sidebar:
             type="password",
             help="Get a free key at aistudio.google.com",
         )
-        
 
     if st.button("Clear Current Chat"):
         st.session_state.chat_histories[selected_name] = []
         st.rerun()
 
-# Main Header
 st.title(f"🏥 {active_agent['name']}")
 st.caption("Modular Multi-Agent AI Engine — Built in Python for Resource-Constrained Clinical Workflows")
 
@@ -389,16 +423,53 @@ if selected_name == "Clinical Ward Triage & Supply Steward":
         delta_color="inverse" if supplies["malaria_rdts"] <= LOW_STOCK_THRESHOLDS["malaria_rdts"] else "normal",
     )
 
+    # Instant 0-second clinical controls so non-technical peers can test immediately even during API congestion
+    with st.expander("⚡ Quick Ward Actions (Instant — No AI Wait)", expanded=False):
+        qcol1, qcol2, qcol3 = st.columns(3)
+        if qcol1.button("Use 1 Oxygen Cylinder", use_container_width=True):
+            st.toast(use_supply({"item": "oxygen_cylinders", "quantity": 1}))
+            st.rerun()
+        if qcol2.button("Use 1 IV Fluid Bag", use_container_width=True):
+            st.toast(use_supply({"item": "iv_fluid_bags", "quantity": 1}))
+            st.rerun()
+        if qcol3.button("Use 1 Malaria RDT", use_container_width=True):
+            st.toast(use_supply({"item": "malaria_rdts", "quantity": 1}))
+            st.rerun()
+
+        with st.form("quick_admit_form", clear_on_submit=True):
+            f1, f2, f3, f4, f5, f6 = st.columns([1, 1.5, 2, 1, 1, 1])
+            q_bed = f1.text_input("Bed", value="Bed 1")
+            q_name = f2.text_input("Patient Name", value="Aline")
+            q_comp = f3.text_input("Complaint", value="Dyspnea")
+            q_spo2 = f4.number_input("SpO2 %", min_value=50, max_value=100, value=87)
+            q_hr = f5.number_input("HR", min_value=30, max_value=220, value=126)
+            q_rr = f6.number_input("RR", min_value=6, max_value=60, value=32)
+            if st.form_submit_button("Admit Patient Now"):
+                msg = admit_patient({
+                    "bed": q_bed,
+                    "name": q_name,
+                    "complaint": q_comp,
+                    "spo2": q_spo2,
+                    "hr": q_hr,
+                    "rr": q_rr,
+                })
+                st.toast(msg)
+                st.rerun()
+
     if st.session_state.ward_patients:
         st.markdown("**Active Ward Beds:**")
         for p in st.session_state.ward_patients:
             badge = "🔴" if "RED" in p["acuity"] else ("🟡" if "YELLOW" in p["acuity"] else "🟢")
-            st.info(
+            bcol1, bcol2 = st.columns([5, 1])
+            bcol1.info(
                 f"{badge} **{p['bed']} — {p['name']}** | **{p['acuity']}** | "
                 f"Complaint: {p['complaint']} (SpO2: {p['spo2']}%, HR: {p['hr']}, RR: {p['rr']})"
             )
+            if bcol2.button(f"Discharge {p['bed']}", key=f"disc_{p['bed']}"):
+                st.toast(discharge_patient({"bed": p["bed"]}))
+                st.rerun()
     else:
-        st.info("No patients currently admitted. Try typing: *Admit Aline to Bed 1 with dyspnea, SpO2 87, HR 126, RR 32*")
+        st.info("No patients currently admitted. Use the chat below or open **Quick Ward Actions** above.")
 
     st.divider()
 
@@ -425,12 +496,10 @@ if user_message:
         st.warning("Please paste your free Gemini API key in the left sidebar first.")
         st.stop()
 
-    # Save and display the user's message
     history.append({"role": "user", "content": user_message})
     with st.chat_message("user"):
         st.write(user_message)
 
-    # Assemble the system prompt dynamically from the active agent's tools
     tools = active_agent["tools"]
     tool_section = FORMAT + "\nTools:"
     for tool_name in tools:
@@ -477,5 +546,14 @@ if user_message:
 
                         history.append({"role": "tool", "content": result})
 
-    # Refresh the page so the live Ward Supply & Bed Monitor updates immediately
+                        # For direct action tools, display the result immediately in 1 LLM call
+                        if tool_name in DIRECT_ACTION_TOOLS:
+                            confirm_json = json.dumps({
+                                "type": "response_to_human",
+                                "message": f"✅ {result}",
+                            })
+                            history.append({"role": "assistant", "content": confirm_json})
+                            st.write(f"✅ {result}")
+                            is_working = False
+
     st.rerun()
