@@ -1,6 +1,7 @@
 import json
 import streamlit as st
 from google import genai
+from google.genai import errors
 
 # --- PAGE CONFIGURATION ---
 st.set_page_config(
@@ -287,11 +288,17 @@ AGENTS = {
 def call_gemini(prompt, api_key):
     """Sends the formatted conversation transcript to Gemini and returns plain text."""
     client = genai.Client(api_key=api_key)
-    response = client.models.generate_content(
-        model="gemini-3.8-flash",
-        contents=prompt,
-    )
-    return response.text
+    try:
+        response = client.models.generate_content(
+            model="gemini-3.8-flash",
+            contents=prompt,
+        )
+        return response.text
+    except errors.ServerError:
+        return json.dumps({
+            "type": "response_to_human",
+            "message": "Google's AI server is temporarily busy. Please send your message again in a few seconds.",
+        })
 
 
 def parse_model_reply(reply):
