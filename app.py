@@ -1,11 +1,13 @@
 import json
+import urllib.request
+import urllib.error
 import streamlit as st
 from google import genai
 from google.genai import errors, types
 
 # --- PAGE CONFIGURATION ---
 st.set_page_config(
-    page_title="Clinical Ward Triage & Multi-Agent Assistant",
+    page_title="Modular Multi-Agent Clinical & Productivity Assistant",
     page_icon="🏥",
     layout="wide",
 )
@@ -27,7 +29,6 @@ LOW_STOCK_THRESHOLDS = {
     "malaria_rdts": 5,
 }
 
-# Action tools return complete human-ready confirmations on the first call (no 2nd LLM trip needed)
 DIRECT_ACTION_TOOLS = {
     "admit_patient",
     "use_supply",
@@ -307,36 +308,67 @@ AGENTS = {
 
 @st.cache_resource
 def get_gemini_client(api_key):
-    """Reuses a single Gemini client connection across messages for faster responses."""
+    """Reuses a single Gemini client connection across messages."""
     return genai.Client(api_key=api_key)
 
 
-def call_gemini(prompt, api_key):
-    """Sends the formatted conversation transcript to Gemini with compact output settings."""
-    client = get_gemini_client(api_key)
-    try:
-        response = client.models.generate_content(
-            model="gemini-3.8-flash",
-            contents=prompt,
-            config=types.GenerateContentConfig(
-                temperature=0.1,
-                max_output_tokens=300,
-            ),
-        )
-        return response.text
-    except errors.ServerError:
-        return json.dumps({
-            "type": "response_to_human",
-            "message": (
-                "Google's AI server is currently experiencing high traffic. "
-                "You can retry your message in a few seconds, or use the Quick Ward Actions panel above for instant 0-second updates."
-            ),
-        })
-    except errors.ClientError:
-        return json.dumps({
-            "type": "response_to_human",
-            "message": "API key or request error. Please verify your Gemini API key in Settings.",
-        })
+def call_groq(prompt, groq_key):
+    """Calls Groq's fast inference API using Python's built-in urllib (no extra package needed)."""
+    url = "https://api.groq.com/openai/v1/chat/completions"
+    payload = json.dumps({
+        "model": "llama-3.3-70b-versatile",
+        "messages": [{"role": "user", "content": prompt}],
+        "temperature": 0.1,
+        "max_tokens": 300,
+    }).encode("utf-8")
+
+    req = urllib.request.Request(
+        url,
+        data=payload,
+        headers={
+            "Authorization": f"Bearer {groq_key}",
+            "Content-Type": "application/json",
+            "User-Agent": "Mozilla/5.0",
+        },
+        method="POST",
+    )
+    with urllib.request.urlopen(req, timeout=20) as resp:
+        data = json.loads(resp.read().decode("utf-8"))
+        return data["choices"][0]["message"]["content"]
+
+
+def call_llm(prompt, gemini_key, groq_key):
+    """Routes to Groq if configured (fast on cloud hosts), otherwise tries Gemini models with fallback."""
+    if groq_key:
+        try:
+            return call_groq(prompt, groq_key)
+        except Exception as e:
+            return json.dumps({
+                "type": "response_to_human",
+                "message": f"Groq connection issue: {e}",
+            })
+
+    client = get_gemini_client(gemini_key)
+    last_error = ""
+    for model_name in ["gemini-3.8-flash", "gemini-2.5-flash-lite", "gemini-2.0-flash"]:
+        try:
+            response = client.models.generate_content(
+                model=model_name,
+                contents=prompt,
+                config=types.GenerateContentConfig(
+                    temperature=0.1,
+                    max_output_tokens=300,
+                ),
+            )
+            return response.text
+        except (errors.ServerError, errors.ClientError) as e:
+            last_error = f"{model_name}: {e.message}"
+            continue
+
+    return json.dumps({
+        "type": "response_to_human",
+        "message": f"Gemini server busy ({last_error}). Try again shortly or add a free GROQ_API_KEY in Secrets.",
+    })
 
 
 def parse_model_reply(reply):
@@ -377,28 +409,32 @@ with st.sidebar:
     st.divider()
 
     try:
-        server_key = st.secrets["GEMINI_API_KEY"]
+        server_gemini = st.secrets.get("GEMINI_API_KEY", None)
+        server_groq = st.secrets.get("GROQ_API_KEY", None)
     except Exception:
-        server_key = None
+        server_gemini = None
+        server_groq = None
 
-    if server_key:
-        api_key = server_key
+    if server_groq:
+        gemini_key = server_gemini
+        groq_key = server_groq
+        st.success("Connected via fast server key")
+    elif server_gemini:
+        gemini_key = server_gemini
+        groq_key = None
         st.success("Connected via server API key")
     else:
-        api_key = st.text_input(
-            "Enter Gemini API Key (for local testing):",
-            type="password",
-            help="Get a free key at aistudio.google.com",
-        )
+        gemini_key = st.text_input("Enter Gemini API Key:", type="password")
+        groq_key = None
 
     if st.button("Clear Current Chat"):
         st.session_state.chat_histories[selected_name] = []
         st.rerun()
 
 st.title(f"🏥 {active_agent['name']}")
-st.caption("Modular Multi-Agent AI Engine — Built in Python for Resource-Constrained Clinical Workflows")
+st.caption("Modular Multi-Agent AI Engine — Powered by Natural-Language Tool Calling")
 
-# Live Visual Dashboard when viewing the Clinical Ward Agent
+# Live Visual Status Panels for Each Agent
 if selected_name == "Clinical Ward Triage & Supply Steward":
     st.subheader("Live Ward Supply & Bed Monitor")
     col1, col2, col3 = st.columns(3)
@@ -423,53 +459,16 @@ if selected_name == "Clinical Ward Triage & Supply Steward":
         delta_color="inverse" if supplies["malaria_rdts"] <= LOW_STOCK_THRESHOLDS["malaria_rdts"] else "normal",
     )
 
-    # Instant 0-second clinical controls so non-technical peers can test immediately even during API congestion
-    with st.expander("⚡ Quick Ward Actions (Instant — No AI Wait)", expanded=False):
-        qcol1, qcol2, qcol3 = st.columns(3)
-        if qcol1.button("Use 1 Oxygen Cylinder", use_container_width=True):
-            st.toast(use_supply({"item": "oxygen_cylinders", "quantity": 1}))
-            st.rerun()
-        if qcol2.button("Use 1 IV Fluid Bag", use_container_width=True):
-            st.toast(use_supply({"item": "iv_fluid_bags", "quantity": 1}))
-            st.rerun()
-        if qcol3.button("Use 1 Malaria RDT", use_container_width=True):
-            st.toast(use_supply({"item": "malaria_rdts", "quantity": 1}))
-            st.rerun()
-
-        with st.form("quick_admit_form", clear_on_submit=True):
-            f1, f2, f3, f4, f5, f6 = st.columns([1, 1.5, 2, 1, 1, 1])
-            q_bed = f1.text_input("Bed", value="Bed 1")
-            q_name = f2.text_input("Patient Name", value="Aline")
-            q_comp = f3.text_input("Complaint", value="Dyspnea")
-            q_spo2 = f4.number_input("SpO2 %", min_value=50, max_value=100, value=87)
-            q_hr = f5.number_input("HR", min_value=30, max_value=220, value=126)
-            q_rr = f6.number_input("RR", min_value=6, max_value=60, value=32)
-            if st.form_submit_button("Admit Patient Now"):
-                msg = admit_patient({
-                    "bed": q_bed,
-                    "name": q_name,
-                    "complaint": q_comp,
-                    "spo2": q_spo2,
-                    "hr": q_hr,
-                    "rr": q_rr,
-                })
-                st.toast(msg)
-                st.rerun()
-
     if st.session_state.ward_patients:
         st.markdown("**Active Ward Beds:**")
         for p in st.session_state.ward_patients:
             badge = "🔴" if "RED" in p["acuity"] else ("🟡" if "YELLOW" in p["acuity"] else "🟢")
-            bcol1, bcol2 = st.columns([5, 1])
-            bcol1.info(
+            st.info(
                 f"{badge} **{p['bed']} — {p['name']}** | **{p['acuity']}** | "
                 f"Complaint: {p['complaint']} (SpO2: {p['spo2']}%, HR: {p['hr']}, RR: {p['rr']})"
             )
-            if bcol2.button(f"Discharge {p['bed']}", key=f"disc_{p['bed']}"):
-                st.toast(discharge_patient({"bed": p["bed"]}))
-                st.rerun()
     else:
-        st.info("No patients currently admitted. Use the chat below or open **Quick Ward Actions** above.")
+        st.info("No patients currently admitted. Try typing: *Admit Aline to Bed 1 with dyspnea, SpO2 87, HR 126, RR 32*")
 
     st.divider()
 
@@ -492,8 +491,8 @@ for msg in history:
 user_message = st.chat_input(f"Message {active_agent['name']}...")
 
 if user_message:
-    if not api_key:
-        st.warning("Please paste your free Gemini API key in the left sidebar first.")
+    if not gemini_key and not groq_key:
+        st.warning("Please configure an API key in the sidebar or Streamlit Secrets.")
         st.stop()
 
     history.append({"role": "user", "content": user_message})
@@ -514,7 +513,7 @@ if user_message:
             while is_working:
                 full_messages = [{"role": "system", "content": system_prompt}] + history
                 prompt = format_messages(full_messages)
-                reply = call_gemini(prompt, api_key)
+                reply = call_llm(prompt, gemini_key, groq_key)
 
                 try:
                     parsed = parse_model_reply(reply)
@@ -546,7 +545,6 @@ if user_message:
 
                         history.append({"role": "tool", "content": result})
 
-                        # For direct action tools, display the result immediately in 1 LLM call
                         if tool_name in DIRECT_ACTION_TOOLS:
                             confirm_json = json.dumps({
                                 "type": "response_to_human",
