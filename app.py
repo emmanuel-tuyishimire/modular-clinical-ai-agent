@@ -13,30 +13,21 @@ st.set_page_config(
 )
 
 # --- GLOBAL CONSTANTS ---
-MAX_TOOL_CALLS = 5
+MAX_TOOL_CALLS = 6
 
 FORMAT = (
     "Reply with exactly one JSON dictionary, with no other text.\n"
     'To talk to the user: {"type": "response_to_human", "message": "..."}\n'
     'To use a tool: {"type": "tool_call_request", "tool_name": "...", "tool_parameters": {...}}\n'
     "Request one tool at a time, then stop. You will be shown the result and can reply again.\n"
-    "Do not repeat a tool call you have already made for the same request."
+    "Complete ALL requested actions or calculations in sequence before sending response_to_human.\n"
+    "Do not repeat a tool call you have already made with the same parameters."
 )
 
 LOW_STOCK_THRESHOLDS = {
     "oxygen_cylinders": 2,
     "iv_fluid_bags": 4,
     "malaria_rdts": 5,
-}
-
-DIRECT_ACTION_TOOLS = {
-    "admit_patient",
-    "use_supply",
-    "discharge_patient",
-    "add_todo",
-    "complete_todo",
-    "add_expense",
-    "get_total",
 }
 
 
@@ -105,17 +96,7 @@ def admit_patient(parameters):
         "rr": rr,
         "acuity": acuity,
     })
-
-    action_note = ""
-    if "RED" in acuity:
-        action_note = " — Immediate bedside assessment & airway/oxygen readiness required!"
-    elif "YELLOW" in acuity:
-        action_note = " — Urgent clinical review recommended."
-
-    return (
-        f"Admitted {name} to {bed} | Acuity: {acuity} "
-        f"(SpO2: {spo2}%, HR: {hr}, RR: {rr}){action_note}"
-    )
+    return f"Admitted {name} to {bed} | Acuity: {acuity} | SpO2: {spo2}%, HR: {hr}, RR: {rr}"
 
 
 def get_ward_board(parameters):
@@ -346,7 +327,7 @@ def call_groq(prompt, groq_key):
         "model": model_id,
         "messages": [{"role": "user", "content": prompt}],
         "temperature": 0.1,
-        "max_tokens": 300,
+        "max_tokens": 450,
     }).encode("utf-8")
 
     req = urllib.request.Request(
@@ -364,37 +345,61 @@ def call_groq(prompt, groq_key):
         return data["choices"][0]["message"]["content"]
 
 
-def call_llm(prompt, gemini_key, groq_key):
-    """Routes to Groq first for sub-second speed, with automatic fallback to Gemini."""
+def try_gemini(prompt, gemini_key):
+    """Calls Google Gemini models with automatic fallback between Flash tiers."""
+    client = get_gemini_client(gemini_key)
+    last_err = ""
+    for model_name in ["gemini-3.8-flash", "gemini-3.5-flash-lite"]:
+        try:
+            response = client.models.generate_content(
+                model=model_name,
+                contents=prompt,
+                config=types.GenerateContentConfig(
+                    temperature=0.1,
+                    max_output_tokens=450,
+                ),
+            )
+            return response.text, ""
+        except (errors.ServerError, errors.ClientError) as e:
+            last_err = f"{model_name}: {e.message}"
+            continue
+    return None, last_err
+
+
+def call_llm(prompt, gemini_key, groq_key, engine_choice):
+    """Routes to the selected AI engine (Auto, Google Gemini, or Groq)."""
     groq_error = ""
-    if groq_key:
+    gemini_error = ""
+
+    if engine_choice == "Google Gemini" and gemini_key:
+        text, gemini_error = try_gemini(prompt, gemini_key)
+        if text:
+            return text
+
+    elif engine_choice == "Groq" and groq_key:
         try:
             return call_groq(prompt, groq_key)
-        except urllib.error.HTTPError as e:
-            details = e.read().decode("utf-8", errors="ignore")
-            groq_error = f"Groq HTTP {e.code}: {details}"
         except Exception as e:
-            groq_error = f"Groq error: {e}"
+            groq_error = str(e)
 
-    if gemini_key:
-        client = get_gemini_client(gemini_key)
-        for model_name in ["gemini-3.8-flash", "gemini-2.5-flash-lite", "gemini-2.0-flash"]:
+    else:
+        # Auto mode: Fast Groq primary + Google Gemini automatic backup
+        if groq_key:
             try:
-                response = client.models.generate_content(
-                    model=model_name,
-                    contents=prompt,
-                    config=types.GenerateContentConfig(
-                        temperature=0.1,
-                        max_output_tokens=300,
-                    ),
-                )
-                return response.text
-            except (errors.ServerError, errors.ClientError):
-                continue
+                return call_groq(prompt, groq_key)
+            except urllib.error.HTTPError as e:
+                groq_error = f"Groq HTTP {e.code}"
+            except Exception as e:
+                groq_error = str(e)
+
+        if gemini_key:
+            text, gemini_error = try_gemini(prompt, gemini_key)
+            if text:
+                return text
 
     return json.dumps({
         "type": "response_to_human",
-        "message": f"AI connection issue ({groq_error or 'all models busy'}). Please try again shortly.",
+        "message": f"AI connection issue ({groq_error or gemini_error or 'no active key'}). Please try again shortly.",
     })
 
 
@@ -433,8 +438,6 @@ with st.sidebar:
     selected_name = st.selectbox("Choose an Agent:", list(AGENTS.keys()))
     active_agent = AGENTS[selected_name]
 
-    st.divider()
-
     try:
         server_gemini = st.secrets.get("GEMINI_API_KEY", None)
         server_groq = st.secrets.get("GROQ_API_KEY", None)
@@ -442,14 +445,17 @@ with st.sidebar:
         server_gemini = None
         server_groq = None
 
-    if server_groq:
+    engine_choice = st.selectbox(
+        "AI Engine:",
+        ["Auto (Groq + Gemini Backup)", "Google Gemini", "Groq"],
+    )
+
+    st.divider()
+
+    if server_groq or server_gemini:
         gemini_key = server_gemini
         groq_key = server_groq
-        st.success("Connected via fast server key")
-    elif server_gemini:
-        gemini_key = server_gemini
-        groq_key = None
-        st.success("Connected via server API key")
+        st.success("Connected via server keys")
     else:
         gemini_key = st.text_input("Enter Gemini API Key:", type="password")
         groq_key = None
@@ -459,7 +465,7 @@ with st.sidebar:
         st.rerun()
 
 st.title(f"🏥 {active_agent['name']}")
-st.caption("Modular Multi-Agent AI Engine — Powered by Natural-Language Tool Calling")
+st.caption("Modular Multi-Agent AI Engine — Powered by Multi-Step Natural-Language Tool Calling")
 
 # Live Visual Status Panel for the Clinical Ward Agent
 if selected_name == "Clinical Ward Triage & Supply Steward":
@@ -536,11 +542,11 @@ if user_message:
     is_working = True
 
     with st.chat_message("assistant"):
-        with st.spinner("Agent thinking and checking tools..."):
+        with st.spinner("Agent reasoning and running tools..."):
             while is_working:
                 full_messages = [{"role": "system", "content": system_prompt}] + history
                 prompt = format_messages(full_messages)
-                reply = call_llm(prompt, gemini_key, groq_key)
+                reply = call_llm(prompt, gemini_key, groq_key, engine_choice)
 
                 try:
                     parsed = parse_model_reply(reply)
@@ -571,14 +577,5 @@ if user_message:
                             result = "Unknown tool: " + tool_name
 
                         history.append({"role": "tool", "content": result})
-
-                        if tool_name in DIRECT_ACTION_TOOLS:
-                            confirm_json = json.dumps({
-                                "type": "response_to_human",
-                                "message": f"✅ {result}",
-                            })
-                            history.append({"role": "assistant", "content": confirm_json})
-                            st.write(f"✅ {result}")
-                            is_working = False
 
     st.rerun()
