@@ -1,6 +1,7 @@
 import json
 import urllib.error
 import urllib.request
+import gspread
 import streamlit as st
 from google import genai
 from google.genai import errors, types
@@ -35,36 +36,205 @@ LOW_STOCK_THRESHOLDS = {
 # 1. INITIALIZE BROWSER MEMORY (st.session_state)
 # =====================================================================
 
-if "ward_patients" not in st.session_state:
-    st.session_state.ward_patients = []
+def init_session_defaults():
+    if "ward_patients" not in st.session_state:
+        st.session_state.ward_patients = []
+    if "ward_supplies" not in st.session_state:
+        st.session_state.ward_supplies = {
+            "oxygen_cylinders": 3,
+            "iv_fluid_bags": 10,
+            "malaria_rdts": 20,
+        }
+    if "todos" not in st.session_state:
+        st.session_state.todos = []
+    if "expenses" not in st.session_state:
+        st.session_state.expenses = []
+    if "chat_histories" not in st.session_state:
+        st.session_state.chat_histories = {
+            "Clinical Ward Triage & Supply Steward": [],
+            "To-do list": [],
+            "Finance tracker": [],
+        }
+    if "active_user" not in st.session_state:
+        st.session_state.active_user = None
+    if "active_pin" not in st.session_state:
+        st.session_state.active_pin = None
 
-if "ward_supplies" not in st.session_state:
+
+init_session_defaults()
+
+
+# =====================================================================
+# 2. GOOGLE SHEETS PERSISTENT MEMORY HELPERS
+# =====================================================================
+
+@st.cache_resource
+def get_gsheet_workbook():
+    """Connects to the private Google Sheet using Streamlit Secrets."""
+    if "gcp_service_account" not in st.secrets or "GSHEET_URL" not in st.secrets:
+        return None
+    creds = dict(st.secrets["gcp_service_account"])
+    gc = gspread.service_account_from_dict(creds)
+    return gc.open_by_url(st.secrets["GSHEET_URL"])
+
+
+def get_worksheets(sh):
+    """Returns (chat_logs_ws, app_state_ws), creating them with headers if missing."""
+    titles = [ws.title for ws in sh.worksheets()]
+
+    if "chat_logs" in titles:
+        chat_ws = sh.worksheet("chat_logs")
+    else:
+        chat_ws = sh.add_worksheet(title="chat_logs", rows=1000, cols=5)
+        chat_ws.append_row(["username", "pin", "agent", "role", "content"])
+
+    if "app_state" in titles:
+        state_ws = sh.worksheet("app_state")
+    else:
+        state_ws = sh.add_worksheet(title="app_state", rows=200, cols=3)
+        state_ws.append_row(["username", "pin", "state_json"])
+
+    return chat_ws, state_ws
+
+
+def current_state_snapshot():
+    return json.dumps({
+        "ward_patients": st.session_state.ward_patients,
+        "ward_supplies": st.session_state.ward_supplies,
+        "todos": st.session_state.todos,
+        "expenses": st.session_state.expenses,
+    })
+
+
+def sign_in_user(username, pin):
+    """Loads existing user chat history and state from Google Sheets, or creates a new profile."""
+    sh = get_gsheet_workbook()
+    if sh is None:
+        return False, "Google Sheet secrets are not configured yet."
+
+    chat_ws, state_ws = get_worksheets(sh)
+    clean_user = username.strip()
+    clean_pin = str(pin).strip()
+
+    state_records = state_ws.get_all_records()
+    matched_row = None
+    for row in state_records:
+        if str(row.get("username", "")).strip().lower() == clean_user.lower():
+            matched_row = row
+            break
+
+    if matched_row is not None:
+        if str(matched_row.get("pin", "")).strip() != clean_pin:
+            return False, "Incorrect PIN for this username."
+
+        try:
+            saved = json.loads(matched_row.get("state_json", "{}"))
+            st.session_state.ward_patients = saved.get("ward_patients", [])
+            st.session_state.ward_supplies = saved.get("ward_supplies", {
+                "oxygen_cylinders": 3,
+                "iv_fluid_bags": 10,
+                "malaria_rdts": 20,
+            })
+            st.session_state.todos = saved.get("todos", [])
+            st.session_state.expenses = saved.get("expenses", [])
+        except Exception:
+            pass
+
+        restored_histories = {
+            "Clinical Ward Triage & Supply Steward": [],
+            "To-do list": [],
+            "Finance tracker": [],
+        }
+        for row in chat_ws.get_all_records():
+            if str(row.get("username", "")).strip().lower() == clean_user.lower():
+                agent = row.get("agent", "")
+                if agent in restored_histories:
+                    restored_histories[agent].append({
+                        "role": str(row.get("role", "")),
+                        "content": str(row.get("content", "")),
+                    })
+
+        st.session_state.chat_histories = restored_histories
+        st.session_state.active_user = clean_user
+        st.session_state.active_pin = clean_pin
+        return True, f"Welcome back, {clean_user}! Full chat history loaded."
+
+    st.session_state.ward_patients = []
     st.session_state.ward_supplies = {
         "oxygen_cylinders": 3,
         "iv_fluid_bags": 10,
         "malaria_rdts": 20,
     }
-
-if "todos" not in st.session_state:
     st.session_state.todos = []
-
-if "expenses" not in st.session_state:
     st.session_state.expenses = []
-
-if "chat_histories" not in st.session_state:
     st.session_state.chat_histories = {
         "Clinical Ward Triage & Supply Steward": [],
         "To-do list": [],
         "Finance tracker": [],
     }
+    state_ws.append_row([clean_user, clean_pin, current_state_snapshot()])
+    st.session_state.active_user = clean_user
+    st.session_state.active_pin = clean_pin
+    return True, f"Profile created for {clean_user}. All prompts and replies will be saved."
+
+
+def sync_turn_to_sheets(agent_name, new_messages):
+    """Appends the latest turn's messages and updates the user's saved state in Google Sheets."""
+    if not st.session_state.active_user:
+        return
+    try:
+        sh = get_gsheet_workbook()
+        if sh is None:
+            return
+        chat_ws, state_ws = get_worksheets(sh)
+        user = st.session_state.active_user
+        pin = st.session_state.active_pin
+
+        rows_to_add = [
+            [user, pin, agent_name, m["role"], m["content"]]
+            for m in new_messages
+        ]
+        if rows_to_add:
+            chat_ws.append_rows(rows_to_add)
+
+        all_rows = state_ws.get_all_values()
+        for idx, r in enumerate(all_rows[1:], start=2):
+            if r and r[0].strip().lower() == user.lower():
+                state_ws.update_cell(idx, 3, current_state_snapshot())
+                break
+    except Exception as e:
+        st.warning(f"Could not sync to Google Sheets: {e}")
+
+
+def clear_agent_in_sheets(agent_name):
+    """Removes a specific agent's chat rows for the active user in Google Sheets."""
+    if not st.session_state.active_user:
+        return
+    try:
+        sh = get_gsheet_workbook()
+        if sh is None:
+            return
+        chat_ws, _ = get_worksheets(sh)
+        user = st.session_state.active_user.lower()
+        all_rows = chat_ws.get_all_values()
+        if len(all_rows) <= 1:
+            return
+        header = all_rows[0]
+        kept = [
+            r for r in all_rows[1:]
+            if not (len(r) >= 3 and r[0].strip().lower() == user and r[2] == agent_name)
+        ]
+        chat_ws.clear()
+        chat_ws.append_rows([header] + kept)
+    except Exception as e:
+        st.warning(f"Could not clear sheet rows: {e}")
 
 
 # =====================================================================
-# 2. CLINICAL WARD TRIAGE & SUPPLY TOOLS (AGENT 1)
+# 3. CLINICAL WARD TRIAGE & SUPPLY TOOLS (AGENT 1)
 # =====================================================================
 
 def calculate_acuity(spo2, hr, rr):
-    """Deterministically classifies patient triage acuity from objective vital signs."""
     if spo2 < 90 or rr > 30 or hr > 130:
         return "RED (Immediate)"
     elif spo2 <= 93 or rr > 22 or hr > 110:
@@ -74,7 +244,6 @@ def calculate_acuity(spo2, hr, rr):
 
 
 def admit_patient(parameters):
-    """Tool: Admits a patient to a free bed and computes objective triage acuity."""
     bed = str(parameters["bed"]).strip()
     name = str(parameters["name"]).strip()
     complaint = str(parameters["complaint"]).strip()
@@ -100,21 +269,16 @@ def admit_patient(parameters):
 
 
 def get_ward_board(parameters):
-    """Tool: Returns all admitted patients with their bed, acuity tier, and vital signs."""
     if len(st.session_state.ward_patients) == 0:
         return "The ward currently has no admitted patients."
-
-    lines = []
-    for p in st.session_state.ward_patients:
-        lines.append(
-            f"{p['bed']} - {p['name']} [{p['acuity']}]: {p['complaint']} "
-            f"(SpO2 {p['spo2']}%, HR {p['hr']}, RR {p['rr']})"
-        )
-    return "\n".join(lines)
+    return "\n".join(
+        f"{p['bed']} - {p['name']} [{p['acuity']}]: {p['complaint']} "
+        f"(SpO2 {p['spo2']}%, HR {p['hr']}, RR {p['rr']})"
+        for p in st.session_state.ward_patients
+    )
 
 
 def check_supplies(parameters):
-    """Tool: Reports current stock levels and flags any items at or below reorder thresholds."""
     lines = []
     for item, count in st.session_state.ward_supplies.items():
         alert = " [LOW STOCK]" if count <= LOW_STOCK_THRESHOLDS[item] else ""
@@ -123,31 +287,26 @@ def check_supplies(parameters):
 
 
 def use_supply(parameters):
-    """Tool: Deducts used clinical supplies and triggers an immediate low-stock warning if needed."""
     item = str(parameters["item"]).lower().strip()
     quantity = int(parameters.get("quantity", 1))
 
     if item not in st.session_state.ward_supplies:
         valid_items = ", ".join(st.session_state.ward_supplies.keys())
         return f"Unknown supply '{item}'. Available items: {valid_items}."
-
     if quantity < 1:
         return "Quantity used must be at least 1."
-
     if st.session_state.ward_supplies[item] < quantity:
         return f"Stock error: Only {st.session_state.ward_supplies[item]} {item} remaining."
 
     st.session_state.ward_supplies[item] -= quantity
     remaining = st.session_state.ward_supplies[item]
     status = f"Logged {quantity} {item} used. Remaining: {remaining}."
-
     if remaining <= LOW_STOCK_THRESHOLDS[item]:
         status += f" [LOW STOCK ALERT: Reorder {item} immediately!]"
     return status
 
 
 def discharge_patient(parameters):
-    """Tool: Discharges a patient by bed label and frees the bed for new admissions."""
     bed = str(parameters["bed"]).strip()
     for i in range(len(st.session_state.ward_patients)):
         if st.session_state.ward_patients[i]["bed"].lower() == bed.lower():
@@ -198,7 +357,7 @@ WARD_AGENT = {
 
 
 # =====================================================================
-# 3. TO-DO & FINANCE AGENTS (AGENTS 2 & 3)
+# 4. TO-DO & FINANCE AGENTS (AGENTS 2 & 3)
 # =====================================================================
 
 def add_todo(parameters):
@@ -284,18 +443,16 @@ AGENTS = {
 
 
 # =====================================================================
-# 4. AI CONNECTION & PROMPT HELPERS
+# 5. AI CONNECTION & PROMPT HELPERS
 # =====================================================================
 
 @st.cache_resource
 def get_gemini_client(api_key):
-    """Reuses a single Gemini client connection across messages."""
     return genai.Client(api_key=api_key)
 
 
 @st.cache_data(ttl=3600)
 def get_groq_model(groq_key):
-    """Fetches Groq's active models list and picks an available chat model automatically."""
     req = urllib.request.Request(
         "https://api.groq.com/openai/v1/models",
         headers={
@@ -320,7 +477,6 @@ def get_groq_model(groq_key):
 
 
 def call_groq(prompt, groq_key):
-    """Calls Groq's fast inference API using an auto-detected active model."""
     model_id = get_groq_model(groq_key)
     url = "https://api.groq.com/openai/v1/chat/completions"
     payload = json.dumps({
@@ -346,7 +502,6 @@ def call_groq(prompt, groq_key):
 
 
 def try_gemini(prompt, gemini_key):
-    """Calls Google Gemini models with automatic fallback between Flash tiers."""
     client = get_gemini_client(gemini_key)
     last_err = ""
     for model_name in ["gemini-3.8-flash", "gemini-3.5-flash-lite"]:
@@ -367,7 +522,6 @@ def try_gemini(prompt, gemini_key):
 
 
 def call_llm(prompt, gemini_key, groq_key, engine_choice):
-    """Routes to the selected AI engine (Auto, Google Gemini, or Groq)."""
     groq_error = ""
     gemini_error = ""
 
@@ -375,15 +529,12 @@ def call_llm(prompt, gemini_key, groq_key, engine_choice):
         text, gemini_error = try_gemini(prompt, gemini_key)
         if text:
             return text
-
     elif engine_choice == "Groq" and groq_key:
         try:
             return call_groq(prompt, groq_key)
         except Exception as e:
             groq_error = str(e)
-
     else:
-        # Auto mode: Fast Groq primary + Google Gemini automatic backup
         if groq_key:
             try:
                 return call_groq(prompt, groq_key)
@@ -391,7 +542,6 @@ def call_llm(prompt, gemini_key, groq_key, engine_choice):
                 groq_error = f"Groq HTTP {e.code}"
             except Exception as e:
                 groq_error = str(e)
-
         if gemini_key:
             text, gemini_error = try_gemini(prompt, gemini_key)
             if text:
@@ -404,7 +554,6 @@ def call_llm(prompt, gemini_key, groq_key, engine_choice):
 
 
 def parse_model_reply(reply):
-    """Extracts and parses the model's JSON dictionary even if wrapped in extra text or fences."""
     cleaned = reply.strip()
     start = cleaned.find("{")
     end = cleaned.rfind("}")
@@ -414,7 +563,6 @@ def parse_model_reply(reply):
 
 
 def format_messages(messages):
-    """Serializes the list of message dictionaries into a single prompt string."""
     result = ""
     for message in messages:
         if message["role"] == "system":
@@ -430,11 +578,36 @@ def format_messages(messages):
 
 
 # =====================================================================
-# 5. STREAMLIT WEB INTERFACE
+# 6. STREAMLIT WEB INTERFACE
 # =====================================================================
 
 with st.sidebar:
     st.title("⚙️ Agent Controls")
+
+    st.subheader("👤 Saved Chat Profile")
+    if st.session_state.active_user:
+        st.success(f"Signed in as **{st.session_state.active_user}** (Auto-saving)")
+        if st.button("Sign Out"):
+            st.session_state.active_user = None
+            st.session_state.active_pin = None
+            st.rerun()
+    else:
+        with st.form("profile_login_form"):
+            in_user = st.text_input("Your Name / Username", placeholder="e.g., Emmanuel")
+            in_pin = st.text_input("Personal 4-Digit PIN", type="password", placeholder="e.g., 1234")
+            if st.form_submit_button("Load / Create My History"):
+                if not in_user.strip() or not in_pin.strip():
+                    st.warning("Enter both a username and a PIN.")
+                else:
+                    ok, status_msg = sign_in_user(in_user, in_pin)
+                    if ok:
+                        st.toast(status_msg)
+                        st.rerun()
+                    else:
+                        st.error(status_msg)
+
+    st.divider()
+
     selected_name = st.selectbox("Choose an Agent:", list(AGENTS.keys()))
     active_agent = AGENTS[selected_name]
 
@@ -450,24 +623,21 @@ with st.sidebar:
         ["Auto (Groq + Gemini Backup)", "Google Gemini", "Groq"],
     )
 
-    st.divider()
-
     if server_groq or server_gemini:
         gemini_key = server_gemini
         groq_key = server_groq
-        st.success("Connected via server keys")
     else:
         gemini_key = st.text_input("Enter Gemini API Key:", type="password")
         groq_key = None
 
     if st.button("Clear Current Chat"):
         st.session_state.chat_histories[selected_name] = []
+        clear_agent_in_sheets(selected_name)
         st.rerun()
 
 st.title(f"🏥 {active_agent['name']}")
 st.caption("Modular Multi-Agent AI Engine — Powered by Multi-Step Natural-Language Tool Calling")
 
-# Live Visual Status Panel for the Clinical Ward Agent
 if selected_name == "Clinical Ward Triage & Supply Steward":
     st.subheader("Live Ward Supply & Bed Monitor")
     col1, col2, col3 = st.columns(3)
@@ -505,7 +675,6 @@ if selected_name == "Clinical Ward Triage & Supply Steward":
 
     st.divider()
 
-# Display existing chat messages for the active agent
 history = st.session_state.chat_histories[selected_name]
 for msg in history:
     if msg["role"] == "user":
@@ -520,7 +689,6 @@ for msg in history:
         except Exception:
             pass
 
-# Chat input box at the bottom of the webpage
 user_message = st.chat_input(f"Message {active_agent['name']}...")
 
 if user_message:
@@ -528,7 +696,11 @@ if user_message:
         st.warning("Please configure an API key in the sidebar or Streamlit Secrets.")
         st.stop()
 
-    history.append({"role": "user", "content": user_message})
+    turn_messages = []
+    user_entry = {"role": "user", "content": user_message}
+    history.append(user_entry)
+    turn_messages.append(user_entry)
+
     with st.chat_message("user"):
         st.write(user_message)
 
@@ -551,13 +723,17 @@ if user_message:
                 try:
                     parsed = parse_model_reply(reply)
                 except Exception:
-                    history.append({"role": "assistant", "content": reply})
+                    asst_entry = {"role": "assistant", "content": reply}
+                    history.append(asst_entry)
+                    turn_messages.append(asst_entry)
                     st.write(reply)
                     is_working = False
                     break
 
                 if parsed["type"] == "response_to_human":
-                    history.append({"role": "assistant", "content": reply})
+                    asst_entry = {"role": "assistant", "content": reply}
+                    history.append(asst_entry)
+                    turn_messages.append(asst_entry)
                     st.write(parsed["message"])
                     is_working = False
 
@@ -569,13 +745,19 @@ if user_message:
                         tool_calls += 1
                         tool_name = parsed["tool_name"]
                         tool_parameters = parsed["tool_parameters"]
-                        history.append({"role": "assistant", "content": reply})
+
+                        asst_entry = {"role": "assistant", "content": reply}
+                        history.append(asst_entry)
+                        turn_messages.append(asst_entry)
 
                         if tool_name in tools:
                             result = tools[tool_name]["function"](tool_parameters)
                         else:
                             result = "Unknown tool: " + tool_name
 
-                        history.append({"role": "tool", "content": result})
+                        tool_entry = {"role": "tool", "content": result}
+                        history.append(tool_entry)
+                        turn_messages.append(tool_entry)
 
+    sync_turn_to_sheets(selected_name, turn_messages)
     st.rerun()
