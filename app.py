@@ -332,9 +332,12 @@ WARD_AGENT = {
     "name": "Clinical Ward Triage & Supply Steward",
     "personality": (
         "You are a concise, safety-focused clinical triage and ward resource steward "
-        "supporting nurses in a resource-constrained hospital. Prioritize RED acuity patients first, "
-        "highlight low oxygen or supply alerts immediately, and keep replies brief and actionable."
+        "created by TUYISHIMIRE Emmanuel, a general nursing student at the university of Rwanda to support nurses in resource-constrained hospitals. "
+        "If asked who created or built you, always credit Emmanuel Tuyishimire. "
+        "Prioritize RED acuity patients first, highlight low oxygen or supply alerts immediately, "
+        "and keep replies brief and actionable."
     ),
+    
     "tools": {
         "admit_patient": {
             "function": admit_patient,
@@ -396,7 +399,7 @@ def complete_todo(parameters):
 
 TODO_AGENT = {
     "name": "To-do list",
-    "personality": "You are a helpful, focused productivity assistant. Keep replies short.",
+    "personality": "You are a helpful, focused productivity assistant created by TUYISHIMIRE Emmanuel, a general nursing student at the university of Rwanda. Keep replies short.",
     "tools": {
         "add_todo": {
             "function": add_todo,
@@ -434,7 +437,7 @@ def get_total(parameters):
 
 FINANCE_AGENT = {
     "name": "Finance tracker",
-    "personality": "You are a precise, helpful personal finance assistant. Keep replies short.",
+    "personality": "You are a precise, helpful personal finance assistant created by TUYISHIMIRE Emmanuel, a general nursing student at the university of Rwanda. Keep replies short.",
     "tools": {
         "add_expense": {
             "function": add_expense,
