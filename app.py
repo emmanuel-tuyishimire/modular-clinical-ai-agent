@@ -71,9 +71,19 @@ init_session_defaults()
 @st.cache_resource
 def get_gsheet_workbook():
     """Connects to the private Google Sheet using Streamlit Secrets."""
-    if "gcp_service_account" not in st.secrets or "GSHEET_URL" not in st.secrets:
+    if "GSHEET_URL" not in st.secrets:
         return None
-    creds = dict(st.secrets["gcp_service_account"])
+
+    if "GCP_SERVICE_ACCOUNT_JSON" in st.secrets:
+        creds = json.loads(st.secrets["GCP_SERVICE_ACCOUNT_JSON"])
+    elif "gcp_service_account" in st.secrets:
+        creds = dict(st.secrets["gcp_service_account"])
+    else:
+        return None
+
+    if "private_key" in creds:
+        creds["private_key"] = creds["private_key"].replace("\\n", "\n").strip()
+
     gc = gspread.service_account_from_dict(creds)
     return gc.open_by_url(st.secrets["GSHEET_URL"])
 
